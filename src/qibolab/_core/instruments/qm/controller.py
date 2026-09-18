@@ -667,7 +667,10 @@ class QmController(Controller):
                     )
                     return {"program": qua_program, "config": asdict(self.config)}
 
-                machine = self.manager.open_qm(asdict(self.config))
+                machine = self.manager.open_qm(
+                    asdict(self.config),
+                    keep_dc_offsets_when_closing=self.keep_dc_offsets_on,
+                )
                 program_id = machine.compile(qua_program)
                 self.cache = Cache(
                     machine=machine, program_id=program_id, acquisitions=acquisitions
@@ -676,7 +679,12 @@ class QmController(Controller):
 
             pending_job = self.cache.run()
             job = pending_job.wait_for_execution()
-            handles = job.result_handles
-            handles.wait_for_all_values()  # for async replace with ``handles.is_processing()``
-            results |= fetch_results(handles, self.cache.acquisitions.values())
+            try:
+                handles = job.result_handles
+                handles.wait_for_all_values()  # for async replace with ``handles.is_processing()``
+                results |= fetch_results(handles, self.cache.acquisitions.values())
+            except BaseException:
+                job.halt()
+                raise
+            
         return results
