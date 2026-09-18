@@ -111,33 +111,33 @@ def assign_variables_to_element(element, *variables):
 
 @dataclass
 class RawAcquisition(Acquisition):
-    """QUA variables used for raw waveform acquisition."""
-
-    adc_stream: _ResultSource | None = None
-    """Stream to collect raw ADC data."""
+    adc_streams: list = field(default_factory=list)
+    _count: int = 0
 
     def declare(self):
-        self.adc_stream = declare_stream(adc_trace=True)
+        self.adc_streams = [declare_stream(adc_trace=True) for _ in self.keys]
 
     def measure(self, operation):
         qua.reset_phase(self.element)
-        qua.measure(operation, self.element, self.adc_stream)
+        stream = self.adc_streams[self._count % self.npulses]
+        self._count += 1
+        qua.measure(operation, self.element, stream)
 
     def download(self, *dimensions):
-        istream = self.adc_stream.input1()
-        qstream = self.adc_stream.input2()
-        if self.average:
-            istream = istream.average()
-            qstream = qstream.average()
-        istream.save(f"{self.name}_I")
-        qstream.save(f"{self.name}_Q")
+        for k, stream in enumerate(self.adc_streams):
+            istream, qstream = stream.input1(), stream.input2()
+            if self.average:
+                istream, qstream = istream.average(), qstream.average()
+            istream.save(f"{self.name}_{k}_I")
+            qstream.save(f"{self.name}_{k}_Q")
 
     def fetch(self, handles):
-        ires = handles.get(f"{self.name}_I").fetch_all()
-        qres = handles.get(f"{self.name}_Q").fetch_all()
-        # convert raw ADC signal to volts
-        signal = _collect(raw_to_volts(ires), raw_to_volts(qres), self.npulses)
-        return _split(signal, self.npulses)
+        out = []
+        for k in range(self.npulses):
+            i = handles.get(f"{self.name}_{k}_I").fetch_all()
+            q = handles.get(f"{self.name}_{k}_Q").fetch_all()
+            out.append(np.stack([raw_to_volts(i), raw_to_volts(q)], axis=-1))
+        return out
 
 
 @dataclass
