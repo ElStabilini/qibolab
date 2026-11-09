@@ -28,7 +28,6 @@ class ZiIqConfig(IqConfig):
 
     kind: Literal["zi-iq"] = "zi-iq"
 
-    # TODO: double check the values, apparently there's confusion between dB and dBm
     power_range: float
     """Output range in dBm.
 
@@ -42,7 +41,6 @@ class ZiAcquisitionConfig(AcquisitionConfig):
 
     kind: Literal["zi-acquisition"] = "zi-acquisition"
 
-    # TODO: double check the values, apparently there's confusion between dB and dBm
     power_range: float
     """Input range in dBm.
 
