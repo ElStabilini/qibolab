@@ -1,11 +1,11 @@
 """Zurich Instruments controller, built on LabOne Q."""
 
 import re
-from collections.abc import Iterable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Literal
 
-import numpy as np
+import laboneq.simple as lq
 from laboneq.dsl.device import DeviceSetup, create_connection
 from laboneq.dsl.device.instruments import HDAWG, PQSC, SHFQA, SHFSG
 from laboneq.simple import (
@@ -27,17 +27,21 @@ from qibolab._core.components import (
     Channel,
     Config,
     DcChannel,
-    DcConfig,
     ExponentialFilter,
-    FiniteImpulseResponseFilter,
     IqChannel,
 )
-from qibolab._core.execution_parameters import ExecutionParameters
+from qibolab._core.execution_parameters import (
+    AcquisitionType,
+    AveragingMode,
+    ExecutionParameters,
+)
 from qibolab._core.identifier import ChannelId, Result
 from qibolab._core.instruments.abstract import Controller
 from qibolab._core.pulses import PulseId
 from qibolab._core.sequence import PulseSequence
 from qibolab._core.sweeper import ParallelSweepers
+
+from . import pulse, results, sweep
 
 __all__ = ["ZiInstrument", "ZiController"]
 
@@ -48,6 +52,11 @@ PQSC_UID = "pqsc"
 """Uid of the PQSC in the LabOne Q device setup."""
 
 InstrumentKind = Literal["HDAWG", "SHFSG", "SHFQA"]
+
+_AVERAGING = {
+    AveragingMode.CYCLIC: lq.AveragingMode.CYCLIC,
+    AveragingMode.SINGLESHOT: lq.AveragingMode.SINGLE_SHOT,
+}
 
 _INSTRUMENT_CLASSES = {"HDAWG": HDAWG, "SHFSG": SHFSG, "SHFQA": SHFQA}
 
@@ -188,6 +197,99 @@ def device_setup(
     return setup
 
 
+def signals(
+    channels: dict[ChannelId, Channel], sequences: list[PulseSequence]
+) -> list[ChannelId]:
+    """Channels to be mapped to the signals of an experiment.
+
+    Other than the channels used in ``sequences``, they include the probe channels of
+    the used acquisition ones, and all the DC channels: the offset of a DC channel
+    only reaches the instrument if its signal is part of the experiment.
+    """
+    used = {id for sequence in sequences for id in sequence.channels}
+    probes = {channels[id].iqout(id) for id in used} - {None}
+    dc = {id for id, ch in channels.items() if isinstance(ch, DcChannel)}
+    return sorted(used | probes | dc)
+
+
+def _precompensation(filters: list) -> Precompensation | None:
+    """LabOne Q precompensation for the filters of a DC channel."""
+    if len(filters) == 0:
+        return None
+    exponential = [f for f in filters if isinstance(f, ExponentialFilter)]
+    fir = [f for f in filters if not isinstance(f, ExponentialFilter)]
+    if len(exponential) > 8 or len(fir) > 1:
+        raise NotImplementedError(
+            "At most 8 exponential filters and 1 FIR filter are supported."
+        )
+    return Precompensation(
+        exponential=[
+            ExponentialCompensation(
+                timeconstant=f.tau * pulse.NS, amplitude=f.amplitude
+            )
+            for f in exponential
+        ]
+        or None,
+        FIR=FIRCompensation(coefficients=fir[0].coefficients) if fir else None,
+    )
+
+
+def calibration(
+    ids: list[ChannelId],
+    channels: dict[ChannelId, Channel],
+    instruments: dict[str, ZiInstrument],
+    configs: dict[str, Config],
+) -> Calibration:
+    """Build the LabOne Q calibration of the channels ``ids`` from their configs.
+
+    Channels with the same LO name share the LO. An acquisition channel shares the
+    oscillator of its probe channel, which is software-modulated.
+    """
+    los: dict[str, Oscillator] = {}
+    oscillators: dict[ChannelId, Oscillator] = {}
+
+    def lo(id: ChannelId) -> Oscillator:
+        name = channels[id].lo
+        if name is None:
+            raise ValueError(f"Channel '{id}' has no LO.")
+        return los.setdefault(name, Oscillator(frequency=configs[name].frequency))
+
+    def oscillator(id: ChannelId) -> Oscillator:
+        software = instruments[channels[id].device].kind == "SHFQA"
+        return oscillators.setdefault(
+            id,
+            Oscillator(
+                frequency=configs[id].frequency - lo(id).frequency,
+                modulation_type=ModulationType.SOFTWARE
+                if software
+                else ModulationType.HARDWARE,
+            ),
+        )
+
+    calib = Calibration()
+    for id in ids:
+        channel, config = channels[id], configs[id]
+        if isinstance(channel, DcChannel):
+            calib[id] = SignalCalibration(
+                voltage_offset=config.offset,
+                range=config.power_range,
+                precompensation=_precompensation(config.filters),
+            )
+        elif isinstance(channel, AcquisitionChannel):
+            calib[id] = SignalCalibration(
+                oscillator=oscillator(channel.probe),
+                port_delay=config.delay * pulse.NS,
+                range=config.power_range,
+            )
+        else:
+            calib[id] = SignalCalibration(
+                oscillator=oscillator(id),
+                local_oscillator=lo(id),
+                range=config.power_range,
+            )
+    return calib
+
+
 class ZiController(Controller):
     """Controller for a Zurich Instruments rack, driven through LabOne Q.
 
@@ -253,6 +355,16 @@ class ZiController(Controller):
         self.session.disconnect()
         self._session = None
 
+    def _experiment(self, ids: list[ChannelId], calib: Calibration) -> Experiment:
+        """Experiment with the channels ``ids`` as signals, calibrated by ``calib``."""
+        experiment = Experiment(signals=[ExperimentSignal(id) for id in ids])
+        for id in ids:
+            experiment.map_signal(
+                id, self.session.device_setup.logical_signal_by_uid(id)
+            )
+        experiment.set_calibration(calib)
+        return experiment
+
     def _zero_dc_offsets(self) -> None:
         """Set the offset of every DC channel to 0.
 
@@ -262,16 +374,10 @@ class ZiController(Controller):
         flux = [id for id, ch in self.channels.items() if isinstance(ch, DcChannel)]
         if len(flux) == 0:
             return
-        experiment = Experiment(
-            uid="zero_dc_offsets", signals=[ExperimentSignal(id) for id in flux]
-        )
-        calibration = Calibration()
+        calib = Calibration()
         for id in flux:
-            experiment.map_signal(
-                id, self.session.device_setup.logical_signal_by_uid(id)
-            )
-            calibration[id] = SignalCalibration(voltage_offset=0.0)
-        experiment.set_calibration(calibration)
+            calib[id] = SignalCalibration(voltage_offset=0.0)
+        experiment = self._experiment(flux, calib)
         with experiment.acquire_loop_rt(count=1):
             pass
         self.session.run(self.session.compile(experiment))
@@ -283,5 +389,49 @@ class ZiController(Controller):
         options: ExecutionParameters,
         sweepers: list[ParallelSweepers],
     ) -> dict[PulseId, Result]:
-        """Not implemented yet."""
-        raise NotImplementedError
+        """Execute the sequences in a single LabOne Q experiment.
+
+        Each sequence is followed by the relaxation time. All the sweepers run in
+        near time. Only :attr:`AcquisitionType.INTEGRATION` is supported, with cyclic or
+        single-shot averaging.
+        """
+        if options.acquisition_type is not AcquisitionType.INTEGRATION:
+            raise NotImplementedError(f"{options.acquisition_type} is not supported.")
+        if options.averaging_mode not in _AVERAGING:
+            raise NotImplementedError(f"{options.averaging_mode} is not supported.")
+        if options.fast_reset:
+            raise NotImplementedError("Fast reset is not supported.")
+
+        ids = signals(self.channels, sequences)
+        calib = calibration(ids, self.channels, self.instruments, configs)
+        experiment = self._experiment(ids, calib)
+        parameters = sweep.near_time(sweepers, self.channels, configs, calib)
+        with ExitStack() as stack:
+            for group in parameters:
+                stack.enter_context(experiment.sweep(parameter=group))
+            stack.enter_context(
+                experiment.acquire_loop_rt(
+                    count=options.nshots,
+                    averaging_mode=_AVERAGING[options.averaging_mode],
+                    acquisition_type=lq.AcquisitionType.INTEGRATION,
+                )
+            )
+            for sequence in sequences:
+                with experiment.section():
+                    for id in ids:
+                        experiment.reserve(id)
+                    pulse.play(
+                        experiment, sequence, self.channels, configs, SAMPLING_RATE
+                    )
+                with experiment.section():
+                    for id in ids:
+                        experiment.delay(id, time=options.relaxation_time * pulse.NS)
+
+        data = self.session.run(self.session.compile(experiment))
+        return {
+            acquisition.id: results.parse(
+                data.get_data(str(acquisition.id)), options, len(sweepers)
+            )
+            for sequence in sequences
+            for _, acquisition in sequence.acquisitions
+        }
