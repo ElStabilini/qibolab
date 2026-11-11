@@ -9,6 +9,8 @@ from qibolab._core.identifier import ChannelId
 from qibolab._core.pulses import Delay, Envelope, Pulse, Readout, Rectangular
 from qibolab._core.sequence import PulseSequence
 
+from .sweep import Amplitudes
+
 __all__ = []
 
 NS = 1e-9
@@ -32,12 +34,14 @@ def play(
     channels: dict[ChannelId, Channel],
     configs: dict[str, Config],
     sampling_rate: float,
+    amplitudes: Amplitudes,
 ) -> None:
     """Add the operations of ``sequence`` to the current section of ``experiment``.
 
     A :class:`Readout` plays its probe pulse and acquires at the same time, integrating
     with unit weights (custom kernels are not supported). A delay on an acquisition
-    channel also delays its probe channel, to keep them aligned.
+    channel also delays its probe channel, to keep them aligned. Swept amplitudes are
+    taken from ``amplitudes``, by the id of the pulse or of its readout.
     """
     for id, op in sequence.align_to_delays():
         channel = channels[id]
@@ -49,14 +53,14 @@ def play(
             experiment.play(
                 id,
                 pulse=waveform(op.envelope, op.duration, sampling_rate),
-                amplitude=op.amplitude,
+                amplitude=amplitudes.get(op.id, op.amplitude),
                 phase=op.relative_phase,
             )
         elif isinstance(op, Readout) and configs[id].kernel is None:
             experiment.play(
                 probe,
                 pulse=waveform(op.probe.envelope, op.probe.duration, sampling_rate),
-                amplitude=op.probe.amplitude,
+                amplitude=amplitudes.get(op.id, op.probe.amplitude),
                 phase=op.probe.relative_phase,
             )
             experiment.acquire(

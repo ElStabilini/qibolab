@@ -12,11 +12,8 @@ from laboneq.simple import (
     Calibration,
     Experiment,
     ExperimentSignal,
-    ExponentialCompensation,
-    FIRCompensation,
     ModulationType,
     Oscillator,
-    Precompensation,
     Session,
     SignalCalibration,
 )
@@ -27,7 +24,6 @@ from qibolab._core.components import (
     Channel,
     Config,
     DcChannel,
-    ExponentialFilter,
     IqChannel,
 )
 from qibolab._core.execution_parameters import (
@@ -46,7 +42,10 @@ from . import pulse, results, sweep
 __all__ = ["ZiInstrument", "ZiController"]
 
 SAMPLING_RATE = 2.0
-"""Sampling rate of HDAWG, SHFSG and SHFQA in GSps."""
+"""Sampling rate in GSps of SHFSG and SHFQA, and of an HDAWG set up with them."""
+
+HDAWG_SAMPLING_RATE = 2.4
+"""Sampling rate in GSps of an HDAWG in a setup without SHF instruments."""
 
 PQSC_UID = "pqsc"
 """Uid of the PQSC in the LabOne Q device setup."""
@@ -212,28 +211,6 @@ def signals(
     return sorted(used | probes | dc)
 
 
-def _precompensation(filters: list) -> Precompensation | None:
-    """LabOne Q precompensation for the filters of a DC channel."""
-    if len(filters) == 0:
-        return None
-    exponential = [f for f in filters if isinstance(f, ExponentialFilter)]
-    fir = [f for f in filters if not isinstance(f, ExponentialFilter)]
-    if len(exponential) > 8 or len(fir) > 1:
-        raise NotImplementedError(
-            "At most 8 exponential filters and 1 FIR filter are supported."
-        )
-    return Precompensation(
-        exponential=[
-            ExponentialCompensation(
-                timeconstant=f.tau * pulse.NS, amplitude=f.amplitude
-            )
-            for f in exponential
-        ]
-        or None,
-        FIR=FIRCompensation(coefficients=fir[0].coefficients) if fir else None,
-    )
-
-
 def calibration(
     ids: list[ChannelId],
     channels: dict[ChannelId, Channel],
@@ -270,10 +247,10 @@ def calibration(
     for id in ids:
         channel, config = channels[id], configs[id]
         if isinstance(channel, DcChannel):
+            if len(config.filters) > 0:
+                raise NotImplementedError(f"Filters on '{id}' are not supported.")
             calib[id] = SignalCalibration(
-                voltage_offset=config.offset,
-                range=config.power_range,
-                precompensation=_precompensation(config.filters),
+                voltage_offset=config.offset, range=config.power_range
             )
         elif isinstance(channel, AcquisitionChannel):
             calib[id] = SignalCalibration(
@@ -320,7 +297,13 @@ class ZiController(Controller):
 
     @property
     def sampling_rate(self) -> float:
-        """Sampling rate of the instruments in GSps."""
+        """Sampling rate of the instruments in GSps.
+
+        As LabOne Q does, all the instruments run at the SHF rate when any SHF
+        instrument is present; HDAWGs on their own run at their native rate.
+        """
+        if all(i.kind == "HDAWG" for i in self.instruments.values()):
+            return HDAWG_SAMPLING_RATE
         return SAMPLING_RATE
 
     @property
@@ -405,7 +388,10 @@ class ZiController(Controller):
         ids = signals(self.channels, sequences)
         calib = calibration(ids, self.channels, self.instruments, configs)
         experiment = self._experiment(ids, calib)
-        parameters = sweep.near_time(sweepers, self.channels, configs, calib)
+        amplitudes: sweep.Amplitudes = {}
+        parameters = sweep.near_time(
+            sweepers, self.channels, configs, calib, amplitudes
+        )
         with ExitStack() as stack:
             for group in parameters:
                 stack.enter_context(experiment.sweep(parameter=group))
@@ -421,7 +407,12 @@ class ZiController(Controller):
                     for id in ids:
                         experiment.reserve(id)
                     pulse.play(
-                        experiment, sequence, self.channels, configs, SAMPLING_RATE
+                        experiment,
+                        sequence,
+                        self.channels,
+                        configs,
+                        self.sampling_rate,
+                        amplitudes,
                     )
                 with experiment.section():
                     for id in ids:
