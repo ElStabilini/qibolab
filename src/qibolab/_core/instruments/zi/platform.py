@@ -6,10 +6,14 @@ from qibolab._core.qubits import Qubit
 
 from .controller import InstrumentKind, ZiInstrument, _check_port
 
-__all__ = ["infer_los", "map_ports"]
+__all__ = ["Cluster", "infer_los", "map_ports"]
 
-Ports = dict[str, dict[int, list[QubitId]]]
-"""Wiring: instrument name → port number → names of the connected elements."""
+Cluster = dict[str, tuple[ZiInstrument, dict[int, list[QubitId]]]]
+"""Wiring: instrument name → (instrument, port number → connected elements).
+
+Pass ``{name: instrument for name, (instrument, _) in cluster.items()}`` as the
+controller's ``instruments``.
+"""
 
 _CHANNELS: dict[InstrumentKind, dict[str, type[Channel]]] = {
     "SHFSG": {"drive": IqChannel},
@@ -20,13 +24,6 @@ _CHANNELS: dict[InstrumentKind, dict[str, type[Channel]]] = {
 
 They are keyed by the :class:`Qubit` attribute holding their id.
 """
-
-
-def _instrument(instruments: dict[str, ZiInstrument], name: str) -> ZiInstrument:
-    """Instrument called ``name``, or a clear error."""
-    if name not in instruments:
-        raise ValueError(f"Unknown instrument '{name}'.")
-    return instruments[name]
 
 
 def _element_channels(
@@ -52,18 +49,17 @@ def _element_channels(
 
 
 def map_ports(
-    instruments: dict[str, ZiInstrument],
-    ports: Ports,
+    cluster: Cluster,
     qubits: dict[QubitId, Qubit],
     couplers: dict[QubitId, Qubit] | None = None,
 ) -> dict[ChannelId, Channel]:
     """Create the channels from a compact description of the wiring.
 
-    ``ports`` maps each instrument name to its used ports (0-based), and each port to
-    the elements connected to it. Elements are keys of ``qubits`` or ``couplers``;
-    several elements on one port are multiplexed.
+    ``cluster`` maps each instrument name to the instrument and its used ports
+    (0-based), and each port to the elements connected to it. Elements are keys of
+    ``qubits`` or ``couplers``; several elements on one port are multiplexed.
 
-    The channel types follow from the instrument type in ``instruments``:
+    The channel types follow from the instrument kind:
 
     - SHFSG port: a drive :class:`IqChannel`, plus one for each id in the element's
       ``drive_extra`` (e.g. the ef drive), all on the same port;
@@ -89,8 +85,7 @@ def map_ports(
     elements = qubits | couplers
 
     channels: dict[ChannelId, Channel] = {}
-    for name, instrument_ports in ports.items():
-        instrument = _instrument(instruments, name)
+    for name, (instrument, instrument_ports) in cluster.items():
         if instrument.kind not in _CHANNELS:
             raise ValueError(
                 f"Instrument '{name}' of kind '{instrument.kind}' has no signal ports."
@@ -127,12 +122,10 @@ def _lo_name(name: str, instrument: ZiInstrument, port: int) -> str:
     return f"{name}/o{port}/lo"
 
 
-def infer_los(
-    instruments: dict[str, ZiInstrument], ports: Ports
-) -> dict[tuple[QubitId, bool], str]:
+def infer_los(cluster: Cluster) -> dict[tuple[QubitId, bool], str]:
     """Infer the LO names of the output channels.
 
-    ``ports`` is the same input of :func:`map_ports`. The result maps
+    ``cluster`` is the same input of :func:`map_ports`. The result maps
     ``(element, is_probe)`` to the LO name, one per synthesizer:
 
     - SHFQA and SHFSG4/SHFSG2 port: ``"{instrument}/o{port}/lo"``;
@@ -144,8 +137,7 @@ def infer_los(
     HDAWG ports have no LO.
     """
     los = {}
-    for name, instrument_ports in ports.items():
-        instrument = _instrument(instruments, name)
+    for name, (instrument, instrument_ports) in cluster.items():
         if instrument.kind == "HDAWG":
             continue
         is_probe = instrument.kind == "SHFQA"

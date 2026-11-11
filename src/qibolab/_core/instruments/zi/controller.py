@@ -1,15 +1,22 @@
 """Zurich Instruments controller, built on LabOne Q."""
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 from laboneq.dsl.device import DeviceSetup, create_connection
 from laboneq.dsl.device.instruments import HDAWG, PQSC, SHFQA, SHFSG
 from laboneq.simple import (
     Calibration,
     Experiment,
     ExperimentSignal,
+    ExponentialCompensation,
+    FIRCompensation,
+    ModulationType,
+    Oscillator,
+    Precompensation,
     Session,
     SignalCalibration,
 )
@@ -20,6 +27,9 @@ from qibolab._core.components import (
     Channel,
     Config,
     DcChannel,
+    DcConfig,
+    ExponentialFilter,
+    FiniteImpulseResponseFilter,
     IqChannel,
 )
 from qibolab._core.execution_parameters import ExecutionParameters
