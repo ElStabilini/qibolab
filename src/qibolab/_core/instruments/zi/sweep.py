@@ -12,44 +12,82 @@ __all__ = []
 Amplitudes = dict[PulseId, SweepParameter]
 """Swept amplitude of each pulse, by pulse id."""
 
+Axes = list[int | None]
+"""Qibolab sweeper of each axis of the LabOne Q results, ``None`` for the shots."""
 
-def near_time(
+
+def _group(
+    group: ParallelSweepers,
+    channels: dict[ChannelId, Channel],
+    configs: dict[str, Config],
+    calibration: Calibration,
+    amplitudes: Amplitudes,
+) -> tuple[list[SweepParameter], bool]:
+    """Sweep parameters of one group of parallel sweepers, and their execution type.
+
+    Supported sweeps:
+
+    - frequency of a channel: the parameter replaces the frequency of the channel's
+      oscillator in ``calibration``. It runs in real time if the oscillator is
+      modulated by the hardware (drive), in near time if by the software (probe),
+      since an SHFQA generator cannot be swept in real time in integration mode;
+    - amplitude of pulses: the parameter is recorded in ``amplitudes``, to be used
+      when the pulse is played, and runs in near time.
+    """
+    parameters = []
+    real_time = set()
+    for sweeper in group:
+        if sweeper.parameter is Parameter.frequency:
+            for id in sweeper.channels:
+                oscillator = calibration[id].oscillator
+                lo = configs[channels[id].lo].frequency
+                oscillator.frequency = SweepParameter(values=sweeper.values - lo)
+                parameters.append(oscillator.frequency)
+                real_time.add(oscillator.modulation_type is ModulationType.HARDWARE)
+        elif sweeper.parameter is Parameter.amplitude:
+            for pulse in sweeper.pulses:
+                amplitudes[pulse.id] = SweepParameter(values=sweeper.values)
+                parameters.append(amplitudes[pulse.id])
+                real_time.add(False)
+        else:
+            raise NotImplementedError(
+                f"Sweeping {sweeper.parameter.name} is not supported."
+            )
+    if len(real_time) > 1:
+        raise NotImplementedError(
+            "Sweeping in parallel in near time and in real time is not supported."
+        )
+    return parameters, real_time == {True}
+
+
+def split(
     sweepers: list[ParallelSweepers],
     channels: dict[ChannelId, Channel],
     configs: dict[str, Config],
     calibration: Calibration,
     amplitudes: Amplitudes,
-) -> list[list[SweepParameter]]:
-    """Sweep parameters of each group of parallel sweepers, all in near time.
+) -> tuple[list[list[SweepParameter]], list[list[SweepParameter]], Axes]:
+    """Split the sweepers in near-time and real-time groups, keeping their order.
 
-    Supported sweeps:
+    Each group of parallel sweepers becomes one list of sweep parameters, to be
+    opened as a single LabOne Q sweep. See :func:`_group` for the supported sweeps
+    and for which of them run in real time.
 
-    - frequency of software-modulated (probe) channels: the parameter replaces the
-      frequency of the channel's oscillator in ``calibration``;
-    - amplitude of pulses: the parameter is recorded in ``amplitudes``, to be used
-      when the pulse is played.
+    The last element maps the axes of the LabOne Q results, which are the near-time
+    sweeps, then the shots, then the real-time ones, back to the qibolab sweepers.
     """
-    groups = []
-    for group in sweepers:
-        parameters = []
-        for sweeper in group:
-            if sweeper.parameter is Parameter.frequency:
-                for id in sweeper.channels:
-                    oscillator = calibration[id].oscillator
-                    if oscillator.modulation_type is not ModulationType.SOFTWARE:
-                        raise NotImplementedError(
-                            f"Sweeping the frequency of '{id}' is not supported."
-                        )
-                    lo = configs[channels[id].lo].frequency
-                    oscillator.frequency = SweepParameter(values=sweeper.values - lo)
-                    parameters.append(oscillator.frequency)
-            elif sweeper.parameter is Parameter.amplitude:
-                for pulse in sweeper.pulses:
-                    amplitudes[pulse.id] = SweepParameter(values=sweeper.values)
-                    parameters.append(amplitudes[pulse.id])
-            else:
-                raise NotImplementedError(
-                    f"Sweeping {sweeper.parameter.name} is not supported."
-                )
-        groups.append(parameters)
-    return groups
+    near: list[list[SweepParameter]] = []
+    real: list[list[SweepParameter]] = []
+    near_axes: Axes = []
+    real_axes: Axes = []
+    for index, group in enumerate(sweepers):
+        parameters, real_time = _group(
+            group, channels, configs, calibration, amplitudes
+        )
+        if real_time:
+            real.append(parameters)
+            real_axes.append(index)
+        else:
+            near.append(parameters)
+            near_axes.append(index)
+    return near, real, near_axes + [None] + real_axes

@@ -374,9 +374,11 @@ class ZiController(Controller):
     ) -> dict[PulseId, Result]:
         """Execute the sequences in a single LabOne Q experiment.
 
-        Each sequence is followed by the relaxation time. All the sweepers run in
-        near time. Only :attr:`AcquisitionType.INTEGRATION` is supported, with cyclic or
-        single-shot averaging.
+        Each sequence is followed by the relaxation time. Sweeps of the frequency of
+        a hardware-modulated channel (drive) run in real time, inside the acquisition
+        loop; all the others run in near time, around it. Only
+        :attr:`AcquisitionType.INTEGRATION` is supported, with cyclic or single-shot
+        averaging.
         """
         if options.acquisition_type is not AcquisitionType.INTEGRATION:
             raise NotImplementedError(f"{options.acquisition_type} is not supported.")
@@ -389,11 +391,11 @@ class ZiController(Controller):
         calib = calibration(ids, self.channels, self.instruments, configs)
         experiment = self._experiment(ids, calib)
         amplitudes: sweep.Amplitudes = {}
-        parameters = sweep.near_time(
+        near, real, axes = sweep.split(
             sweepers, self.channels, configs, calib, amplitudes
         )
         with ExitStack() as stack:
-            for group in parameters:
+            for group in near:
                 stack.enter_context(experiment.sweep(parameter=group))
             stack.enter_context(
                 experiment.acquire_loop_rt(
@@ -402,6 +404,8 @@ class ZiController(Controller):
                     acquisition_type=lq.AcquisitionType.INTEGRATION,
                 )
             )
+            for group in real:
+                stack.enter_context(experiment.sweep(parameter=group))
             for sequence in sequences:
                 with experiment.section():
                     for id in ids:
@@ -421,7 +425,7 @@ class ZiController(Controller):
         data = self.session.run(self.session.compile(experiment))
         return {
             acquisition.id: results.parse(
-                data.get_data(str(acquisition.id)), options, len(sweepers)
+                data.get_data(str(acquisition.id)), options, axes
             )
             for sequence in sequences
             for _, acquisition in sequence.acquisitions

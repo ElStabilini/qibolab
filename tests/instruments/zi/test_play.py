@@ -10,7 +10,7 @@ from qibolab._core.execution_parameters import (
     AveragingMode,
     ExecutionParameters,
 )
-from qibolab._core.pulses import Pulse, Readout, Rectangular
+from qibolab._core.pulses import Delay, Pulse, Readout, Rectangular
 from qibolab._core.sequence import PulseSequence
 from qibolab._core.sweeper import Parameter, Sweeper
 
@@ -36,6 +36,28 @@ def readouts(qubits) -> PulseSequence:
     )
 
 
+def drives(qubits, duration: int = 200) -> PulseSequence:
+    """Drive pulse on each qubit, then a delayed readout, as qubit spectroscopy."""
+    drive = Pulse(duration=duration, amplitude=1.0, envelope=Rectangular())
+    sequence = PulseSequence()
+    for q in qubits:
+        sequence.append((f"q{q}/drive", drive.new()))
+        sequence.append((f"q{q}/acquisition", Delay(duration=duration)))
+    return sequence | readouts(qubits)
+
+
+def frequencies(configs, channels, points: int = 5) -> list[Sweeper]:  # noqa: F811
+    """Absolute frequency sweeper of each channel, as the qibocal protocols."""
+    return [
+        Sweeper(
+            parameter=Parameter.frequency,
+            values=configs[channel].frequency + np.linspace(-2e6, 2e6, points),
+            channels=[channel],
+        )
+        for channel in channels
+    ]
+
+
 def options(averaging_mode) -> ExecutionParameters:
     return ExecutionParameters(
         nshots=NSHOTS,
@@ -50,16 +72,8 @@ def options(averaging_mode) -> ExecutionParameters:
 )
 def test_resonator_spectroscopy(connected, configs, averaging_mode):  # noqa: F811
     sequence = readouts(range(NQUBITS))
-    sweepers = [
-        [
-            Sweeper(
-                parameter=Parameter.frequency,
-                values=configs[f"q{q}/probe"].frequency + np.linspace(-2e6, 2e6, 5),
-                channels=[f"q{q}/probe"],
-            )
-            for q in range(NQUBITS)
-        ]
-    ]
+    probes = [f"q{q}/probe" for q in range(NQUBITS)]
+    sweepers = [frequencies(configs, probes)]
     opts = options(averaging_mode)
 
     results = connected.play(configs, [sequence], opts, sweepers)
@@ -92,21 +106,54 @@ def test_resonator_punchout(connected, configs):  # noqa: F811
         range=(0.1, 1.0, 0.3),
         pulses=[ro for _, ro in sequence.acquisitions],
     )
-    frequencies = [
-        Sweeper(
-            parameter=Parameter.frequency,
-            values=configs[probe].frequency + np.linspace(-2e6, 2e6, 5),
-            channels=[probe],
-        )
-        for probe in probes
-    ]
-    sweepers = [[amplitude], frequencies]
+    sweepers = [[amplitude], frequencies(configs, probes)]
     opts = options(AveragingMode.CYCLIC)
 
     results = connected.play(configs, [sequence], opts, sweepers)
 
     for result in results.values():
         assert result.shape == opts.results_shape(sweepers)
+
+
+@pytest.mark.parametrize(
+    "averaging_mode", [AveragingMode.CYCLIC, AveragingMode.SINGLESHOT]
+)
+def test_qubit_spectroscopy(connected, configs, averaging_mode):  # noqa: F811
+    """The drive frequency is swept in real time, inside the acquisition loop."""
+    sequence = drives(range(NQUBITS))
+    drive = [f"q{q}/drive" for q in range(NQUBITS)]
+    sweepers = [frequencies(configs, drive)]
+    opts = options(averaging_mode)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    assert set(results) == {ro.id for _, ro in sequence.acquisitions}
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+@pytest.mark.parametrize(
+    "averaging_mode", [AveragingMode.CYCLIC, AveragingMode.SINGLESHOT]
+)
+def test_near_and_real_time_axes(connected, configs, averaging_mode):  # noqa: F811
+    """A near-time and a real-time sweep come back in the order qibolab asked.
+
+    The two have different lengths, so a swapped axis changes the shape. The
+    real-time drive sweep is given first, although LabOne Q returns it last.
+    """
+    sequence = drives([0])
+    sweepers = [
+        frequencies(configs, ["q0/drive"], points=3),
+        frequencies(configs, ["q0/probe"], points=5),
+    ]
+    opts = options(averaging_mode)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
 
 
 def test_unsupported(connected, configs):  # noqa: F811
@@ -116,16 +163,15 @@ def test_unsupported(connected, configs):  # noqa: F811
     opts = options(AveragingMode.CYCLIC)
     drive = Pulse(duration=40, amplitude=0.5, envelope=Rectangular())
     sequence = PulseSequence([("q0/drive", drive)]) | sequence
-    for sweeper in (
-        Sweeper(
-            parameter=Parameter.frequency,
-            values=np.array([6.3e9]),
-            channels=["q0/drive"],
-        ),
-        Sweeper(parameter=Parameter.duration, values=np.array([40]), pulses=[drive]),
-    ):
-        with pytest.raises(NotImplementedError):
-            connected.play(configs, [sequence], opts, [[sweeper]])
+    duration = Sweeper(
+        parameter=Parameter.duration, values=np.array([40]), pulses=[drive]
+    )
+    with pytest.raises(NotImplementedError, match="duration"):
+        connected.play(configs, [sequence], opts, [[duration]])
+    # the drive frequency is swept in real time, the probe one in near time
+    parallel = frequencies(configs, ["q0/drive", "q0/probe"])
+    with pytest.raises(NotImplementedError, match="real time"):
+        connected.play(configs, [sequence], opts, [parallel])
     for update in (
         {"fast_reset": True},
         {"averaging_mode": AveragingMode.SEQUENTIAL},
