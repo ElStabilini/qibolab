@@ -1,5 +1,6 @@
 """Conversion of qibolab sweepers to LabOne Q sweep parameters."""
 
+import numpy as np
 from laboneq.simple import Calibration, ModulationType, SweepParameter
 
 from qibolab._core.components import Channel, Config
@@ -106,6 +107,14 @@ def split(
         parameters, real_time = _group(
             group, channels, configs, calibration, amplitudes, pulse_channels
         )
+        # LabOne Q cannot compile an unevenly spaced frequency sweep nested in a
+        # real-time sweep ("c_freq_osc_0 already declared")
+        if real and any(
+            s.parameter is Parameter.frequency
+            and abs(np.diff(s.values, 2)).max(initial=0) > 1e-4
+            for s in group
+        ):
+            real_time = False
         if real_time:
             real.append(parameters)
             real_axes.append(index)
