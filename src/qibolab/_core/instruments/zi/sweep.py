@@ -45,10 +45,13 @@ def _group(
 ) -> tuple[list[SweepParameter], bool]:
     """Sweep parameters of one group of parallel sweepers, and their execution type.
 
-    Supported sweeps, both on the channel's own time scale (:func:`_real_time`):
+    Supported sweeps, each on the channel's own time scale (:func:`_real_time`):
 
     - frequency of a channel: the parameter replaces the frequency of the channel's
       oscillator in ``calibration``;
+    - offset of a DC channel: the parameter replaces its ``voltage_offset`` in
+      ``calibration``, so the values are absolute. A DC channel has no oscillator, so
+      it is swept in near time;
     - amplitude of pulses: the parameter is recorded in ``amplitudes``, to be used
       when the pulse is played. The channel of a pulse is the one it is played on in
       the sequences, which for a :class:`Readout` is its acquisition channel.
@@ -62,6 +65,11 @@ def _group(
                 lo = configs[channels[id].lo].frequency
                 oscillator.frequency = SweepParameter(values=sweeper.values - lo)
                 parameters.append(oscillator.frequency)
+                real_time.add(_real_time(id, calibration))
+        elif sweeper.parameter is Parameter.offset:
+            for id in sweeper.channels:
+                calibration[id].voltage_offset = SweepParameter(values=sweeper.values)
+                parameters.append(calibration[id].voltage_offset)
                 real_time.add(_real_time(id, calibration))
         elif sweeper.parameter is Parameter.amplitude:
             for pulse in sweeper.pulses:

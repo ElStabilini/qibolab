@@ -35,11 +35,11 @@ from qibolab._core.identifier import ChannelId, Result
 from qibolab._core.instruments.abstract import Controller
 from qibolab._core.pulses import PulseId
 from qibolab._core.sequence import PulseSequence
-from qibolab._core.sweeper import ParallelSweepers
+from qibolab._core.sweeper import ParallelSweepers, Parameter
 
 from . import pulse, results, sweep
 
-__all__ = ["ZiInstrument", "ZiController"]
+__all__ = ["ZiController", "ZiInstrument"]
 
 SAMPLING_RATE = 2.0
 """Sampling rate in GSps of SHFSG and SHFQA, and of an HDAWG set up with them."""
@@ -334,7 +334,13 @@ class ZiController(Controller):
         if not self.is_connected:
             return
         if not self.keep_dc_offsets_on:
-            self._zero_dc_offsets()
+            self._set_dc_offsets(
+                {
+                    id: 0.0
+                    for id, ch in self.channels.items()
+                    if isinstance(ch, DcChannel)
+                }
+            )
         self.session.disconnect()
         self._session = None
 
@@ -348,19 +354,18 @@ class ZiController(Controller):
         experiment.set_calibration(calib)
         return experiment
 
-    def _zero_dc_offsets(self) -> None:
-        """Set the offset of every DC channel to 0.
+    def _set_dc_offsets(self, offsets: dict[ChannelId, float]) -> None:
+        """Set the offsets of the DC channels in ``offsets``.
 
         A mapped signal's ``voltage_offset`` is applied when the experiment is
         initialized, so an experiment with an empty real-time loop is enough.
         """
-        flux = [id for id, ch in self.channels.items() if isinstance(ch, DcChannel)]
-        if len(flux) == 0:
+        if len(offsets) == 0:
             return
         calib = Calibration()
-        for id in flux:
-            calib[id] = SignalCalibration(voltage_offset=0.0)
-        experiment = self._experiment(flux, calib)
+        for id, offset in offsets.items():
+            calib[id] = SignalCalibration(voltage_offset=offset)
+        experiment = self._experiment(list(offsets), calib)
         with experiment.acquire_loop_rt(count=1):
             pass
         self.session.run(self.session.compile(experiment))
@@ -376,8 +381,9 @@ class ZiController(Controller):
 
         Each sequence is followed by the relaxation time. Sweeps on a
         hardware-modulated channel (drive) run in real time, inside the acquisition
-        loop; the ones on a software-modulated channel (probe) run in near time,
-        around it. Only
+        loop; the ones on a software-modulated channel (probe) and on a DC channel
+        (flux offset) run in near time, around it. After an offset sweep, the swept DC
+        channels are set back to their configured offsets. Only
         :attr:`AcquisitionType.INTEGRATION` is supported, with cyclic or single-shot
         averaging.
         """
@@ -424,6 +430,15 @@ class ZiController(Controller):
                         experiment.delay(id, time=options.relaxation_time * pulse.NS)
 
         data = self.session.run(self.session.compile(experiment))
+        self._set_dc_offsets(
+            {
+                id: configs[id].offset
+                for group in sweepers
+                for sweeper in group
+                if sweeper.parameter is Parameter.offset
+                for id in sweeper.channels
+            }
+        )
         return {
             acquisition.id: results.parse(
                 data.get_data(str(acquisition.id)), options, axes
