@@ -10,7 +10,7 @@ from qibolab._core.execution_parameters import (
     AveragingMode,
     ExecutionParameters,
 )
-from qibolab._core.pulses import Delay, Pulse, Readout, Rectangular
+from qibolab._core.pulses import Delay, Gaussian, Pulse, Readout, Rectangular
 from qibolab._core.sequence import PulseSequence
 from qibolab._core.sweeper import Parameter, Sweeper
 
@@ -44,6 +44,44 @@ def drives(qubits, duration: int = 200) -> PulseSequence:
         sequence.append((f"q{q}/drive", drive.new()))
         sequence.append((f"q{q}/acquisition", Delay(duration=duration)))
     return sequence | readouts(qubits)
+
+
+def rabi(qubits, rx90: bool = False, duration: int = 48) -> PulseSequence:
+    """Drive pulse then delayed readout, as the ``rabi_amplitude_signal`` sequence.
+
+    With ``rx90``, the same pulse is played twice, as qibocal does to calibrate a
+    pi/2 pulse, so the same swept amplitude is used by two operations.
+    """
+    drive = Pulse(duration=duration, amplitude=1.0, envelope=Gaussian(rel_sigma=1 / 6))
+    sequence = PulseSequence()
+    for q in qubits:
+        pulse = drive.new()
+        for _ in range(2 if rx90 else 1):
+            sequence.append((f"q{q}/drive", pulse))
+        sequence.append((f"q{q}/acquisition", Delay(duration=duration)))
+    return sequence | readouts(qubits)
+
+
+def states(qubits) -> list[PulseSequence]:
+    """Readout of the ground and of the excited state, as ``single_shot_classification``.
+
+    The second sequence is the ``RX`` natives aligned before the ``MZ`` ones, so it
+    carries the ``Align`` that ``|`` inserts.
+    """
+    drive = Pulse(duration=48, amplitude=1.0, envelope=Gaussian(rel_sigma=1 / 6))
+    excited = PulseSequence([(f"q{q}/drive", drive.new()) for q in qubits])
+    return [readouts(qubits), excited | readouts(qubits)]
+
+
+def drive_pulses(sequence: PulseSequence) -> list[Pulse]:
+    """The distinct pulses played on the drive channels, as qibocal sweeps them."""
+    return list(
+        {
+            p.id: p
+            for id, p in sequence
+            if id.endswith("/drive") and isinstance(p, Pulse)
+        }.values()
+    )
 
 
 def frequencies(configs, channels, points: int = 5) -> list[Sweeper]:  # noqa: F811
@@ -133,6 +171,49 @@ def test_qubit_spectroscopy(connected, configs, averaging_mode):  # noqa: F811
         assert not np.isnan(result).any()
 
 
+@pytest.mark.parametrize("rx90", [False, True])
+def test_rabi_amplitude_signal(connected, configs, rx90):  # noqa: F811
+    """The amplitude of the drive pulses is swept in real time."""
+    sequence = rabi(range(NQUBITS), rx90=rx90)
+    amplitude = Sweeper(
+        parameter=Parameter.amplitude,
+        range=(0.0, 1.0, 0.25),
+        pulses=drive_pulses(sequence),
+    )
+    sweepers = [[amplitude]]
+    opts = options(AveragingMode.CYCLIC)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    assert set(results) == {ro.id for _, ro in sequence.acquisitions}
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+def test_rabi_amplitude_with_probe_sweep(connected, configs):  # noqa: F811
+    """A real-time drive amplitude nested in a near-time probe one keeps its order."""
+    sequence = rabi([0])
+    drive = Sweeper(
+        parameter=Parameter.amplitude,
+        range=(0.0, 1.0, 0.25),
+        pulses=drive_pulses(sequence),
+    )
+    probe = Sweeper(
+        parameter=Parameter.amplitude,
+        range=(0.1, 0.4, 0.1),
+        pulses=[ro for _, ro in sequence.acquisitions],
+    )
+    sweepers = [[drive], [probe]]
+    opts = options(AveragingMode.CYCLIC)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
 @pytest.mark.parametrize(
     "averaging_mode", [AveragingMode.CYCLIC, AveragingMode.SINGLESHOT]
 )
@@ -151,6 +232,36 @@ def test_near_and_real_time_axes(connected, configs, averaging_mode):  # noqa: F
 
     results = connected.play(configs, [sequence], opts, sweepers)
 
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+def test_single_shot_classification(connected, configs):  # noqa: F811
+    """Two sequences, no sweepers, one result per shot."""
+    sequences = states(range(NQUBITS))
+    opts = options(AveragingMode.SINGLESHOT)
+
+    results = connected.play(configs, sequences, opts, [])
+
+    acquisitions = [ro for sequence in sequences for _, ro in sequence.acquisitions]
+    assert set(results) == {ro.id for ro in acquisitions}
+    assert len(results) == 2 * NQUBITS
+    for result in results.values():
+        assert result.shape == (NSHOTS, 2)
+        assert not np.isnan(result).any()
+
+
+def test_dispersive_shift(connected, configs):  # noqa: F811
+    """The two states of the classification, with one probe-frequency sweep."""
+    sequences = states(range(NQUBITS))
+    probes = [f"q{q}/probe" for q in range(NQUBITS)]
+    sweepers = [frequencies(configs, probes)]
+    opts = options(AveragingMode.CYCLIC)
+
+    results = connected.play(configs, sequences, opts, sweepers)
+
+    assert len(results) == 2 * NQUBITS
     for result in results.values():
         assert result.shape == opts.results_shape(sweepers)
         assert not np.isnan(result).any()
