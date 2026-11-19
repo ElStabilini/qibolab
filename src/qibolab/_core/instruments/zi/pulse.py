@@ -2,30 +2,50 @@
 
 from functools import cache
 
-from laboneq.simple import Experiment, pulse_library
+import numpy as np
+from laboneq.simple import Experiment, Section, pulse_library
+from pydantic import TypeAdapter
 
 from qibolab._core.components import Channel, Config, IqChannel
 from qibolab._core.identifier import ChannelId
-from qibolab._core.pulses import Delay, Envelope, Pulse, Readout, Rectangular
+from qibolab._core.pulses import (
+    Align,
+    Delay,
+    Envelope,
+    Pulse,
+    PulseId,
+    Readout,
+    Rectangular,
+)
 from qibolab._core.sequence import PulseSequence
 
-from .sweep import Amplitudes
+from .sweep import NS, Swept
 
 __all__ = []
 
-NS = 1e-9
-"""Qibolab times are in ns, LabOne Q ones in s."""
+
+@pulse_library.register_pulse_functional
+def qibolab_envelope(x, length, sampling_rate, envelope: dict, **_):
+    """Samples of the qibolab ``envelope`` at the points ``x``, in [-1, 1).
+
+    The envelope is sampled at the pulse's actual length, so that it can be swept.
+    """
+    shape = TypeAdapter(Envelope).validate_python(envelope)
+    samples = round(length * sampling_rate)
+    index = np.rint((x + 1) / 2 * samples).astype(int)
+    return (shape.i(samples) + 1j * shape.q(samples))[index]
 
 
 @cache
-def waveform(envelope: Envelope, duration: float, sampling_rate: float):
-    """Unit-amplitude LabOne Q pulse with the samples of a qibolab envelope.
+def waveform(envelope: Envelope, duration: float):
+    """Unit-amplitude LabOne Q pulse with the shape of a qibolab envelope.
 
     Equal envelopes give the same object, since an SHFQA output can only hold one
     waveform.
     """
-    samples = int(duration * sampling_rate)
-    return pulse_library.sampled_pulse(envelope.i(samples) + 1j * envelope.q(samples))
+    return qibolab_envelope(
+        length=duration * NS, envelope=envelope.model_dump(mode="json")
+    )
 
 
 def play(
@@ -33,40 +53,63 @@ def play(
     sequence: PulseSequence,
     channels: dict[ChannelId, Channel],
     configs: dict[str, Config],
-    sampling_rate: float,
-    amplitudes: Amplitudes,
+    swept: Swept,
 ) -> None:
     """Add the operations of ``sequence`` to the current section of ``experiment``.
 
+    The operations of each channel go into a section of their own, and an
+    :class:`Align` starts new sections on its channels, played after the previous
+    ones of the same channels.
+
     A :class:`Readout` plays its probe pulse and acquires at the same time, integrating
     with unit weights (custom kernels are not supported). A delay on an acquisition
-    channel also delays its probe channel, to keep them aligned. Swept amplitudes are
-    taken from ``amplitudes``, by the id of the pulse or of its readout.
+    channel also delays its probe channel, to keep them aligned. Swept arguments are
+    taken from ``swept``, by the id of the operation.
     """
-    for id, op in sequence.align_to_delays():
+    sections: dict[ChannelId, Section] = {}
+    after: dict[ChannelId, list[str]] = {}
+    aligns: dict[PulseId, list[str]] = {}
+
+    def section(id: ChannelId) -> Section:
+        """Current section of the channel ``id``."""
+        if id not in sections:
+            sections[id] = Section(play_after=after.pop(id, None))
+            experiment.add(sections[id])
+        return sections[id]
+
+    for id, op in sequence:
+        if isinstance(op, Align):
+            if op.id not in aligns:
+                aligns[op.id] = [
+                    section(ch).uid for ch in sequence.pulse_channels(op.id)
+                ]
+            after[id] = aligns[op.id]
+            del sections[id]
+            continue
         channel = channels[id]
         probe = channel.iqout(id)
+        kwargs = swept.get(op.id, {})
         if isinstance(op, Delay):
             for signal in {id, probe} - {None}:
-                experiment.delay(signal, time=op.duration * NS)
+                section(id).delay(signal, **({"time": op.duration * NS} | kwargs))
         elif isinstance(op, Pulse) and isinstance(channel, IqChannel):
-            experiment.play(
+            section(id).play(
                 id,
-                pulse=waveform(op.envelope, op.duration, sampling_rate),
-                amplitude=amplitudes.get(op.id, op.amplitude),
+                pulse=waveform(op.envelope, op.duration),
                 phase=op.relative_phase,
+                **({"amplitude": op.amplitude} | kwargs),
             )
         elif isinstance(op, Readout) and configs[id].kernel is None:
-            experiment.play(
+            section(id).play(
                 probe,
-                pulse=waveform(op.probe.envelope, op.probe.duration, sampling_rate),
-                amplitude=amplitudes.get(op.id, op.probe.amplitude),
+                pulse=waveform(op.probe.envelope, op.probe.duration),
                 phase=op.probe.relative_phase,
+                **({"amplitude": op.probe.amplitude} | kwargs),
             )
-            experiment.acquire(
+            section(id).acquire(
                 id,
                 handle=str(op.id),
-                kernel=waveform(Rectangular(), op.acquisition.duration, sampling_rate),
+                kernel=waveform(Rectangular(), op.acquisition.duration),
             )
         else:
             raise NotImplementedError(

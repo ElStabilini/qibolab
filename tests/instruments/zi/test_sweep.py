@@ -39,21 +39,21 @@ def sequence() -> tuple[PulseSequence, Pulse, Readout]:
 def test_split(channels, configs):  # noqa: F811
     """Sweeps on the drive go to real time, the ones on the probe to near time."""
     calib = calibration(IDS, channels, INSTRUMENTS, configs)
-    _, pulse, readout = sequence()
+    _, pulse, _ = sequence()
     drive = Sweeper(
         parameter=Parameter.frequency,
         values=np.array([6.30e9, 6.31e9]),
         channels=["q0/drive"],
     )
     amplitude = Sweeper(
-        parameter=Parameter.amplitude, values=np.array([0.1, 0.2]), pulses=[readout]
+        parameter=Parameter.amplitude, values=np.array([0.1, 0.2]), pulses=[pulse]
     )
     probe = Sweeper(
         parameter=Parameter.frequency,
         values=np.array([7.0e9]),
         channels=["q0/probe"],
     )
-    amplitudes = {}
+    swept = {}
     # the pulse is played on the probe channel, so its amplitude sweep is near time
     probe_sequence = PulseSequence([("q0/probe", pulse)])
 
@@ -63,7 +63,7 @@ def test_split(channels, configs):  # noqa: F811
         channels,
         configs,
         calib,
-        amplitudes,
+        swept,
     )
 
     # LabOne Q returns the near-time sweeps (1 and 2), the shots, then the drive (0)
@@ -73,7 +73,7 @@ def test_split(channels, configs):  # noqa: F811
     assert real[0][0].values == pytest.approx(drive.values - DRIVE_LO)
     assert near[1][0].values == pytest.approx(probe.values - PROBE_LO)
     assert near[0][0].values == pytest.approx(amplitude.values)
-    assert amplitudes[readout.id] is near[0][0]
+    assert swept[pulse.id]["amplitude"] is near[0][0]
     # the swept parameters are the oscillators of the calibration
     assert calib["q0/drive"].oscillator.frequency is real[0][0]
     assert calib["q0/probe"].oscillator.frequency is near[1][0]
@@ -143,10 +143,38 @@ def test_split_drive_amplitude(channels, configs):  # noqa: F811
         [Sweeper(parameter=Parameter.amplitude, values=values, pulses=[readout])],
         [Sweeper(parameter=Parameter.amplitude, values=values, pulses=[pulse])],
     ]
-    amplitudes = {}
+    swept = {}
 
-    near, real, axes = split(sweepers, [seq], channels, configs, calib, amplitudes)
+    near, real, axes = split(sweepers, [seq], channels, configs, calib, swept)
 
     assert axes == [0, None, 1]
-    assert amplitudes[readout.id] is near[0][0]
-    assert amplitudes[pulse.id] is real[0][0]
+    assert swept[readout.id]["amplitude"] is near[0][0]
+    assert swept[pulse.id]["amplitude"] is real[0][0]
+
+
+def test_split_duration(channels, configs):  # noqa: F811
+    """Durations of pulses and delays are swept in real time, in seconds.
+
+    A delay is swept in real time on any channel, the probe one included.
+    """
+    calib = calibration(IDS, channels, INSTRUMENTS, configs)
+    seq, pulse, readout = sequence()
+    delay = seq[1][1]
+    values = np.array([16, 24, 32])
+    sweepers = [
+        [Sweeper(parameter=Parameter.duration, values=values, pulses=[pulse, delay])]
+    ]
+    swept = {}
+
+    near, real, axes = split(sweepers, [seq], channels, configs, calib, swept)
+
+    assert axes == [None, 0] and len(near) == 0
+    assert real[0] == [swept[pulse.id]["length"], swept[delay.id]["time"]]
+    assert swept[pulse.id]["length"].values == pytest.approx(values * 1e-9)
+    for parameter, target in [
+        (Parameter.duration, readout),
+        (Parameter.duration_interpolated, pulse),
+    ]:
+        sweeper = Sweeper(parameter=parameter, values=values, pulses=[target])
+        with pytest.raises(NotImplementedError):
+            split([[sweeper]], [seq], channels, configs, calib, {})

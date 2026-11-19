@@ -5,11 +5,14 @@ import pytest
 
 pytest.importorskip("laboneq")
 
+from laboneq.simulator.output_simulator import OutputSimulator
+
 from qibolab._core.execution_parameters import (
     AcquisitionType,
     AveragingMode,
     ExecutionParameters,
 )
+from qibolab._core.instruments.zi.pulse import NS
 from qibolab._core.pulses import Delay, Gaussian, Pulse, Readout, Rectangular
 from qibolab._core.sequence import PulseSequence
 from qibolab._core.sweeper import Parameter, Sweeper
@@ -267,6 +270,222 @@ def test_dispersive_shift(connected, configs):  # noqa: F811
         assert not np.isnan(result).any()
 
 
+RX = 48
+"""Duration of the ``RX`` pulse of the duration sweeps, in ns."""
+
+WAITS = np.arange(16, 56, 8)
+"""Swept durations, on the 8 ns grid, which a swept readout start must be on."""
+
+
+def rx() -> Pulse:
+    return Pulse(duration=RX, amplitude=0.5, envelope=Gaussian(rel_sigma=1 / 6))
+
+
+def readout() -> Readout:
+    return Readout.from_probe(
+        Pulse(duration=1000, amplitude=0.1, envelope=Rectangular())
+    )
+
+
+def duration(pulses, values=WAITS) -> Sweeper:
+    return Sweeper(parameter=Parameter.duration, values=values, pulses=pulses)
+
+
+def rabi_length(qubits) -> tuple[PulseSequence, list[Pulse | Delay]]:
+    """Drive pulse, readout delayed by a ``Delay``, both swept, as ``rabi_length``."""
+    sequence = PulseSequence()
+    swept = []
+    for q in qubits:
+        pulse, delay = rx(), Delay(duration=16)
+        sequence.append((f"q{q}/drive", pulse))
+        sequence.append((f"q{q}/acquisition", delay))
+        sequence.append((f"q{q}/acquisition", readout()))
+        swept += [pulse, delay]
+    return sequence, swept
+
+
+@pytest.mark.parametrize(
+    "averaging_mode", [AveragingMode.CYCLIC, AveragingMode.SINGLESHOT]
+)
+def test_rabi_length_signal(connected, configs, averaging_mode):  # noqa: F811
+    sequence, swept = rabi_length(range(NQUBITS))
+    sweepers = [[duration(swept)]]
+    opts = options(averaging_mode)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    assert len(results) == NQUBITS
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+@pytest.mark.parametrize(
+    "averaging_mode", [AveragingMode.CYCLIC, AveragingMode.SINGLESHOT]
+)
+def test_rabi_length_chunked(connected, configs, averaging_mode):  # noqa: F811
+    """A length sweep too big for the waveform memory runs in chunks."""
+    sequence, swept = rabi_length(range(NQUBITS))
+    sweepers = [[duration(swept, np.linspace(16, 1000, 100) // 8 * 8)]]
+    opts = options(averaging_mode)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+@pytest.mark.parametrize(
+    "averaging_mode", [AveragingMode.CYCLIC, AveragingMode.SINGLESHOT]
+)
+def test_t1_signal(connected, configs, averaging_mode):  # noqa: F811
+    """One ``Delay`` object before the readout of every qubit, as ``t1_signal``."""
+    delay = Delay(duration=0)
+    sequence = PulseSequence()
+    for q in range(NQUBITS):
+        sequence.append((f"q{q}/drive", rx()))
+        sequence.append((f"q{q}/acquisition", Delay(duration=RX)))
+        sequence.append((f"q{q}/acquisition", delay))
+        sequence.append((f"q{q}/acquisition", readout()))
+    sweepers = [[duration(NQUBITS * [delay], np.arange(0, 2000, 400))]]
+    opts = options(averaging_mode)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+def test_ramsey_signal(connected, configs):  # noqa: F811
+    """The same pulse twice around a swept ``Delay``, as ``ramsey_signal``."""
+    sequence = PulseSequence()
+    delays = []
+    for q in range(NQUBITS):
+        pulse, wait, ro_wait = rx(), Delay(duration=0), Delay(duration=0)
+        sequence.extend([(f"q{q}/drive", pulse), (f"q{q}/drive", wait)])
+        sequence.append((f"q{q}/drive", pulse))
+        sequence.append((f"q{q}/acquisition", Delay(duration=2 * RX)))
+        sequence.append((f"q{q}/acquisition", ro_wait))
+        sequence.append((f"q{q}/acquisition", readout()))
+        delays += [wait, ro_wait]
+    sweepers = [[duration(delays)]]
+    opts = options(AveragingMode.CYCLIC)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+def test_spin_echo_signal(connected, configs):  # noqa: F811
+    """The same ``Delay`` object repeated on each channel, as ``spin_echo_signal``."""
+    n = 2
+    sequence = PulseSequence()
+    delays = []
+    for q in range(NQUBITS):
+        drive, acquisition = f"q{q}/drive", f"q{q}/acquisition"
+        rx90, pi = rx(), rx()
+        wait, ro_wait = Delay(duration=0), Delay(duration=0)
+        sequence.append((drive, rx90))
+        for _ in range(n):
+            sequence.extend([(drive, wait), (acquisition, ro_wait), (drive, pi)])
+            sequence.extend([(drive, wait), (acquisition, ro_wait)])
+        sequence.append((drive, rx90))
+        sequence.append((acquisition, Delay(duration=(2 + n) * RX)))
+        sequence.append((acquisition, readout()))
+        delays += 2 * n * [wait] + 2 * n * [ro_wait]
+    sweepers = [[duration(delays)]]
+    opts = options(AveragingMode.CYCLIC)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+@pytest.mark.parametrize(
+    "averaging_mode", [AveragingMode.CYCLIC, AveragingMode.SINGLESHOT]
+)
+def test_duration_with_probe_sweep(connected, configs, averaging_mode):  # noqa: F811
+    """A real-time duration given before a near-time probe frequency.
+
+    The two sweeps have different sizes, so a wrong axis order changes the shape.
+    """
+    sequence, swept = rabi_length([0])
+    sweepers = [[duration(swept, WAITS[:4])], frequencies(configs, ["q0/probe"], 3)]
+    opts = options(averaging_mode)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+def test_rabi_length_align(connected, configs):  # noqa: F811
+    """A swept pulse aligned with the readout, as ``rabi_length`` with ``use_align``.
+
+    The lengths are off the 8 ns grid: the readout section starts on the grid.
+    """
+    pulse = rx()
+    sequence = PulseSequence([("q0/drive", pulse)])
+    sequence.align(["q0/drive", "q0/acquisition"])
+    sequence.append(("q0/acquisition", readout()))
+    sweepers = [[duration([pulse], np.array([20, 36, 52]))]]
+    opts = options(AveragingMode.CYCLIC)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    for result in results.values():
+        assert result.shape == opts.results_shape(sweepers)
+        assert not np.isnan(result).any()
+
+
+def start(compiled, controller, signal: str) -> float:
+    """Time in ns of the first output sample of ``signal``, in the first shot."""
+    channel = controller.session.device_setup.logical_signal_by_uid(signal)
+    snippet = OutputSimulator(compiled).get_snippet(
+        channel.physical_channel, start=0, output_length=2e-6
+    )
+    return snippet.time[np.flatnonzero(np.abs(snippet.wave) > 1e-6)[0]] / NS
+
+
+@pytest.mark.parametrize(
+    "length,expected", [(48, 48), (50, 56)], ids=["on-grid", "off-grid"]
+)
+def test_align(connected, configs, monkeypatch, length, expected):  # noqa: F811
+    """A readout aligned to one drive only starts when that drive ends.
+
+    The other drive is longer and not aligned, so it does not delay the readout.
+    After a pulse off the 8 ns grid, the readout starts at the next grid point.
+    """
+    sequence = PulseSequence(
+        [
+            ("q0/drive", Pulse(duration=length, amplitude=0.5, envelope=Rectangular())),
+            ("q1/drive", Pulse(duration=200, amplitude=0.5, envelope=Rectangular())),
+        ]
+    )
+    sequence.align(["q0/drive", "q0/acquisition"])
+    sequence.append(("q0/acquisition", readout()))
+    compiled = []
+    compile = connected.session.compile
+    monkeypatch.setattr(
+        connected.session,
+        "compile",
+        lambda experiment: compiled.append(compile(experiment)) or compiled[-1],
+    )
+
+    connected.play(configs, [sequence], options(AveragingMode.CYCLIC), [])
+
+    drive = start(compiled[0], connected, "q0/drive")
+    probe = start(compiled[0], connected, "q0/probe")
+    assert probe - drive == pytest.approx(expected)
+
+
 def test_unsupported(connected, configs):  # noqa: F811
     sequence = readouts([0])
     with pytest.raises(NotImplementedError):
@@ -274,11 +493,13 @@ def test_unsupported(connected, configs):  # noqa: F811
     opts = options(AveragingMode.CYCLIC)
     drive = Pulse(duration=40, amplitude=0.5, envelope=Rectangular())
     sequence = PulseSequence([("q0/drive", drive)]) | sequence
-    duration = Sweeper(
-        parameter=Parameter.duration, values=np.array([40]), pulses=[drive]
-    )
-    with pytest.raises(NotImplementedError, match="duration"):
-        connected.play(configs, [sequence], opts, [[duration]])
+    for parameter, pulse in [
+        (Parameter.duration_interpolated, drive),
+        (Parameter.duration, sequence.acquisitions[0][1]),
+    ]:
+        duration = Sweeper(parameter=parameter, values=np.array([40]), pulses=[pulse])
+        with pytest.raises(NotImplementedError, match="duration"):
+            connected.play(configs, [sequence], opts, [[duration]])
     # the drive frequency is swept in real time, the probe one in near time
     parallel = frequencies(configs, ["q0/drive", "q0/probe"])
     with pytest.raises(NotImplementedError, match="real time"):

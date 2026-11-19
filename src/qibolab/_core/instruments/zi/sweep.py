@@ -5,14 +5,17 @@ from laboneq.simple import Calibration, ModulationType, SweepParameter
 
 from qibolab._core.components import Channel, Config
 from qibolab._core.identifier import ChannelId
-from qibolab._core.pulses import PulseId
+from qibolab._core.pulses import Delay, PulseId, Readout
 from qibolab._core.sequence import PulseSequence
 from qibolab._core.sweeper import ParallelSweepers, Parameter
 
 __all__ = []
 
-Amplitudes = dict[PulseId, SweepParameter]
-"""Swept amplitude of each pulse, by pulse id."""
+NS = 1e-9
+"""Qibolab times are in ns, LabOne Q ones in s."""
+
+Swept = dict[PulseId, dict[str, SweepParameter]]
+"""Swept arguments of each operation, by its id and the LabOne Q keyword."""
 
 Axes = list[int | None]
 """Qibolab sweeper of each axis of the LabOne Q results, ``None`` for the shots."""
@@ -41,7 +44,7 @@ def _group(
     channels: dict[ChannelId, Channel],
     configs: dict[str, Config],
     calibration: Calibration,
-    amplitudes: Amplitudes,
+    swept: Swept,
     pulse_channels: dict[PulseId, ChannelId],
 ) -> tuple[list[SweepParameter], bool]:
     """Sweep parameters of one group of parallel sweepers, and their execution type.
@@ -53,9 +56,10 @@ def _group(
     - offset of a DC channel: the parameter replaces its ``voltage_offset`` in
       ``calibration``, so the values are absolute. A DC channel has no oscillator, so
       it is swept in near time;
-    - amplitude of pulses: the parameter is recorded in ``amplitudes``, to be used
-      when the pulse is played. The channel of a pulse is the one it is played on in
-      the sequences, which for a :class:`Readout` is its acquisition channel.
+    - amplitude and duration of pulses, and duration of delays: the parameter is
+      recorded in ``swept``, to be used when the operation is played. The channel of a
+      pulse is the one it is played on in the sequences, which for a :class:`Readout`
+      is its acquisition channel. Delays are always swept in real time.
     """
     parameters = []
     real_time = set()
@@ -73,10 +77,25 @@ def _group(
                 parameters.append(calibration[id].voltage_offset)
                 real_time.add(_real_time(id, calibration))
         elif sweeper.parameter is Parameter.amplitude:
-            for pulse in sweeper.pulses:
-                amplitudes[pulse.id] = SweepParameter(values=sweeper.values)
-                parameters.append(amplitudes[pulse.id])
+            for pulse in {p.id: p for p in sweeper.pulses}.values():
+                swept.setdefault(pulse.id, {})["amplitude"] = SweepParameter(
+                    values=sweeper.values
+                )
+                parameters.append(swept[pulse.id]["amplitude"])
                 real_time.add(_real_time(pulse_channels[pulse.id], calibration))
+        elif sweeper.parameter is Parameter.duration:
+            for pulse in {p.id: p for p in sweeper.pulses}.values():
+                if isinstance(pulse, Readout):
+                    raise NotImplementedError("Sweeping a readout duration.")
+                delay = isinstance(pulse, Delay)
+                key = "time" if delay else "length"
+                swept.setdefault(pulse.id, {})[key] = SweepParameter(
+                    values=sweeper.values * NS
+                )
+                parameters.append(swept[pulse.id][key])
+                real_time.add(
+                    delay or _real_time(pulse_channels[pulse.id], calibration)
+                )
         else:
             raise NotImplementedError(
                 f"Sweeping {sweeper.parameter.name} is not supported."
@@ -94,7 +113,7 @@ def split(
     channels: dict[ChannelId, Channel],
     configs: dict[str, Config],
     calibration: Calibration,
-    amplitudes: Amplitudes,
+    swept: Swept,
 ) -> tuple[list[list[SweepParameter]], list[list[SweepParameter]], Axes]:
     """Split the sweepers in near-time and real-time groups, keeping their order.
 
@@ -113,7 +132,7 @@ def split(
     pulse_channels = _channels_of(sequences)
     for index, group in enumerate(sweepers):
         parameters, real_time = _group(
-            group, channels, configs, calibration, amplitudes, pulse_channels
+            group, channels, configs, calibration, swept, pulse_channels
         )
         # LabOne Q cannot compile an unevenly spaced frequency sweep nested in a
         # real-time sweep ("c_freq_osc_0 already declared")

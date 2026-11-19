@@ -380,10 +380,11 @@ class ZiController(Controller):
         """Execute the sequences in a single LabOne Q experiment.
 
         Each sequence is followed by the relaxation time. Sweeps on a
-        hardware-modulated channel (drive) run in real time, inside the acquisition
-        loop; the ones on a software-modulated channel (probe) and on a DC channel
-        (flux offset) run in near time, around it. After an offset sweep, the swept DC
-        channels are set back to their configured offsets. Only
+        hardware-modulated channel (drive) and of delays run in real time, inside the
+        acquisition loop, the outermost one split in chunks when it does not fit in
+        the instruments' memory; the ones on a software-modulated channel (probe) and
+        on a DC channel (flux offset) run in near time, around it. After an offset
+        sweep, the swept DC channels are set back to their configured offsets. Only
         :attr:`AcquisitionType.INTEGRATION` is supported, with cyclic or single-shot
         averaging.
         """
@@ -397,9 +398,9 @@ class ZiController(Controller):
         ids = signals(self.channels, sequences)
         calib = calibration(ids, self.channels, self.instruments, configs)
         experiment = self._experiment(ids, calib)
-        amplitudes: sweep.Amplitudes = {}
+        swept: sweep.Swept = {}
         near, real, axes = sweep.split(
-            sweepers, sequences, self.channels, configs, calib, amplitudes
+            sweepers, sequences, self.channels, configs, calib, swept
         )
         with ExitStack() as stack:
             for group in near:
@@ -411,20 +412,16 @@ class ZiController(Controller):
                     acquisition_type=lq.AcquisitionType.INTEGRATION,
                 )
             )
-            for group in real:
-                stack.enter_context(experiment.sweep(parameter=group))
+            for i, group in enumerate(real):
+                # LabOne Q splits the outermost sweep when it exceeds the memory
+                stack.enter_context(
+                    experiment.sweep(parameter=group, auto_chunking=i == 0)
+                )
             for sequence in sequences:
                 with experiment.section():
                     for id in ids:
                         experiment.reserve(id)
-                    pulse.play(
-                        experiment,
-                        sequence,
-                        self.channels,
-                        configs,
-                        self.sampling_rate,
-                        amplitudes,
-                    )
+                    pulse.play(experiment, sequence, self.channels, configs, swept)
                 with experiment.section():
                     for id in ids:
                         experiment.delay(id, time=options.relaxation_time * pulse.NS)
