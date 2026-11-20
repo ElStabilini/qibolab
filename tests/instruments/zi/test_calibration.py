@@ -82,6 +82,15 @@ def test_probe_and_acquisition_share_oscillator(channels, configs):
     assert acq.range == -30
 
 
+def test_threshold(channels, configs):
+    """The discrimination threshold is set on the acquisition signal."""
+    configs["q2/acquisition"] = configs["q2/acquisition"].model_copy(
+        update={"threshold": 0.25}
+    )
+    calib = calibration(["q2/acquisition"], channels, INSTRUMENTS, configs)
+    assert calib["q2/acquisition"].threshold == pytest.approx(0.25)
+
+
 def test_flux(channels, configs):
     calib = calibration(["q3/flux"], channels, INSTRUMENTS, configs)["q3/flux"]
     assert calib.voltage_offset == pytest.approx(0.3)

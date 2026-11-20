@@ -7,7 +7,7 @@ pytest.importorskip("laboneq")
 
 from laboneq.core.utilities.pulse_sampler import sample_pulse
 
-from qibolab._core.instruments.zi.pulse import NS, waveform
+from qibolab._core.instruments.zi.pulse import NS, kernel, waveform
 from qibolab._core.pulses import (
     Custom,
     Drag,
@@ -62,3 +62,20 @@ def test_same_object():
         Gaussian(rel_sigma=0.2), 40
     )
     assert waveform(Gaussian(rel_sigma=0.2), 40) is not waveform(Rectangular(), 40)
+
+
+@pytest.mark.parametrize("angle", [0.0, 0.4, -2.0])
+def test_kernel_rotation(angle):
+    """Integrating with the kernel rotates as qibolab's classification.
+
+    The SHFQA integrates the signal times the conjugated weights; the real part of
+    the result is the first component of the I/Q point rotated by ``angle``, which
+    the threshold is compared to.
+    """
+    weights = kernel(DURATION, angle)
+    assert weights.length == pytest.approx(DURATION * NS)
+    signal = 0.3 - 0.8j
+    rotated = signal * np.conj(weights.amplitude)
+    c, s = np.cos(angle), np.sin(angle)
+    assert rotated.real == pytest.approx(c * signal.real - s * signal.imag)
+    assert kernel(DURATION, angle) is weights

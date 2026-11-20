@@ -57,6 +57,11 @@ _AVERAGING = {
     AveragingMode.SINGLESHOT: lq.AveragingMode.SINGLE_SHOT,
 }
 
+_ACQUISITION = {
+    AcquisitionType.INTEGRATION: lq.AcquisitionType.INTEGRATION,
+    AcquisitionType.DISCRIMINATION: lq.AcquisitionType.DISCRIMINATION,
+}
+
 _INSTRUMENT_CLASSES = {"HDAWG": HDAWG, "SHFSG": SHFSG, "SHFQA": SHFQA}
 
 
@@ -220,7 +225,8 @@ def calibration(
     """Build the LabOne Q calibration of the channels ``ids`` from their configs.
 
     Channels with the same LO name share the LO. An acquisition channel shares the
-    oscillator of its probe channel, which is software-modulated.
+    oscillator of its probe channel, which is software-modulated, and carries the
+    discrimination threshold.
     """
     los: dict[str, Oscillator] = {}
     oscillators: dict[ChannelId, Oscillator] = {}
@@ -257,6 +263,7 @@ def calibration(
                 oscillator=oscillator(channel.probe),
                 port_delay=config.delay * pulse.NS,
                 range=config.power_range,
+                threshold=config.threshold,
             )
         else:
             calib[id] = SignalCalibration(
@@ -384,11 +391,11 @@ class ZiController(Controller):
         acquisition loop, the outermost one split in chunks when it does not fit in
         the instruments' memory; the ones on a software-modulated channel (probe) and
         on a DC channel (flux offset) run in near time, around it. After an offset
-        sweep, the swept DC channels are set back to their configured offsets. Only
-        :attr:`AcquisitionType.INTEGRATION` is supported, with cyclic or single-shot
-        averaging.
+        sweep, the swept DC channels are set back to their configured offsets.
+        :attr:`AcquisitionType.INTEGRATION` and :attr:`AcquisitionType.DISCRIMINATION`
+        are supported, with cyclic or single-shot averaging.
         """
-        if options.acquisition_type is not AcquisitionType.INTEGRATION:
+        if options.acquisition_type not in _ACQUISITION:
             raise NotImplementedError(f"{options.acquisition_type} is not supported.")
         if options.averaging_mode not in _AVERAGING:
             raise NotImplementedError(f"{options.averaging_mode} is not supported.")
@@ -409,7 +416,7 @@ class ZiController(Controller):
                 experiment.acquire_loop_rt(
                     count=options.nshots,
                     averaging_mode=_AVERAGING[options.averaging_mode],
-                    acquisition_type=lq.AcquisitionType.INTEGRATION,
+                    acquisition_type=_ACQUISITION[options.acquisition_type],
                 )
             )
             for i, group in enumerate(real):
@@ -421,7 +428,14 @@ class ZiController(Controller):
                 with experiment.section():
                     for id in ids:
                         experiment.reserve(id)
-                    pulse.play(experiment, sequence, self.channels, configs, swept)
+                    pulse.play(
+                        experiment,
+                        sequence,
+                        self.channels,
+                        configs,
+                        swept,
+                        options.acquisition_type is AcquisitionType.DISCRIMINATION,
+                    )
                 with experiment.section():
                     for id in ids:
                         experiment.delay(id, time=options.relaxation_time * pulse.NS)

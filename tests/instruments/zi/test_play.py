@@ -488,8 +488,6 @@ def test_align(connected, configs, monkeypatch, length, expected):  # noqa: F811
 
 def test_unsupported(connected, configs):  # noqa: F811
     sequence = readouts([0])
-    with pytest.raises(NotImplementedError):
-        connected.play(configs, [sequence], ExecutionParameters(nshots=1), [])
     opts = options(AveragingMode.CYCLIC)
     drive = Pulse(duration=40, amplitude=0.5, envelope=Rectangular())
     sequence = PulseSequence([("q0/drive", drive)]) | sequence
@@ -507,7 +505,6 @@ def test_unsupported(connected, configs):  # noqa: F811
     for update in (
         {"fast_reset": True},
         {"averaging_mode": AveragingMode.SEQUENTIAL},
-        {"acquisition_type": AcquisitionType.DISCRIMINATION},
         {"acquisition_type": AcquisitionType.RAW},
     ):
         with pytest.raises(NotImplementedError):
