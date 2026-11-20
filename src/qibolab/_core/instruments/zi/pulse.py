@@ -6,7 +6,7 @@ import numpy as np
 from laboneq.simple import Experiment, Section, pulse_library
 from pydantic import TypeAdapter
 
-from qibolab._core.components import Channel, Config, IqChannel
+from qibolab._core.components import Channel, Config, DcChannel, IqChannel
 from qibolab._core.identifier import ChannelId
 from qibolab._core.pulses import (
     Align,
@@ -61,10 +61,11 @@ def play(
     :class:`Align` starts new sections on its channels, played after the previous
     ones of the same channels.
 
-    A :class:`Readout` plays its probe pulse and acquires at the same time, integrating
-    with unit weights (custom kernels are not supported). A delay on an acquisition
-    channel also delays its probe channel, to keep them aligned. Swept arguments are
-    taken from ``swept``, by the id of the operation.
+    A pulse on a DC channel (flux) has no phase. A :class:`Readout` plays its probe
+    pulse and acquires at the same time, integrating with unit weights (custom kernels
+    are not supported). A delay on an acquisition channel also delays its probe
+    channel, to keep them aligned. Swept arguments are taken from ``swept``, by the id
+    of the operation.
     """
     sections: dict[ChannelId, Section] = {}
     after: dict[ChannelId, list[str]] = {}
@@ -92,12 +93,14 @@ def play(
         if isinstance(op, Delay):
             for signal in {id, probe} - {None}:
                 section(id).delay(signal, **({"time": op.duration * NS} | kwargs))
-        elif isinstance(op, Pulse) and isinstance(channel, IqChannel):
+        elif isinstance(op, Pulse) and isinstance(channel, (IqChannel, DcChannel)):
+            phase = (
+                {} if isinstance(channel, DcChannel) else {"phase": op.relative_phase}
+            )
             section(id).play(
                 id,
                 pulse=waveform(op.envelope, op.duration),
-                phase=op.relative_phase,
-                **({"amplitude": op.amplitude} | kwargs),
+                **({"amplitude": op.amplitude} | phase | kwargs),
             )
         elif isinstance(op, Readout) and configs[id].kernel is None:
             section(id).play(

@@ -1,19 +1,31 @@
-"""Tests flux offset sweeps, replicating the calls of the qibocal flux protocols."""
+"""Tests flux offsets and flux pulses, replicating the calls of qibocal protocols."""
 
 import numpy as np
 import pytest
 
 pytest.importorskip("laboneq")
 
-from qibolab._core.execution_parameters import AveragingMode
+from qibolab._core.execution_parameters import AcquisitionType, AveragingMode
 from qibolab._core.instruments.zi.controller import calibration
 from qibolab._core.instruments.zi.sweep import split
+from qibolab._core.pulses import Delay, Pulse, Rectangular
 from qibolab._core.sequence import PulseSequence
 from qibolab._core.sweeper import Parameter, Sweeper
 
 from .conftest import INSTRUMENTS, NQUBITS
 from .test_calibration import channels, configs  # noqa: F401
-from .test_play import connected, drives, frequencies, options, readouts  # noqa: F401
+from .test_play import (  # noqa: F401
+    RX,
+    connected,
+    drives,
+    duration,
+    frequencies,
+    options,
+    readout,
+    readouts,
+    rx,
+    start,
+)
 
 QUBITS = range(NQUBITS)
 
@@ -142,3 +154,145 @@ def test_offsets_not_restored_without_sweep(connected, configs, runs):  # noqa: 
     connected.play(configs, [readouts([0])], options(AveragingMode.CYCLIC), sweepers)
 
     assert len(runs) == 1
+
+
+def amplitude(pulses) -> Sweeper:
+    values = np.linspace(0.1, 0.5, 3)
+    return Sweeper(parameter=Parameter.amplitude, values=values, pulses=pulses)
+
+
+def flux_pulse(length: int = 40) -> Pulse:
+    return Pulse(duration=length, amplitude=0.3, envelope=Rectangular())
+
+
+def discrimination(averaging_mode):
+    return options(averaging_mode).model_copy(
+        update={"acquisition_type": AcquisitionType.DISCRIMINATION}
+    )
+
+
+def test_split_flux_pulse(channels, configs):  # noqa: F811
+    """Amplitude and duration of a flux pulse are swept in real time."""
+    ids = ["q0/flux"]
+    calib = calibration(ids, channels, INSTRUMENTS, configs)
+    pulse = flux_pulse()
+    seq = PulseSequence([("q0/flux", pulse)])
+    swept = {}
+
+    near, real, axes = split(
+        [[duration([pulse])], [amplitude([pulse])]],
+        [seq],
+        channels,
+        configs,
+        calib,
+        swept,
+    )
+
+    assert axes == [None, 0, 1] and len(near) == 0
+    assert real == [[swept[pulse.id]["length"]], [swept[pulse.id]["amplitude"]]]
+
+
+def chevron(low: int, high: int, dt: int = 8):
+    """The ``chevron_sequence`` of qibocal, for the ``CZ`` native of a pair.
+
+    One ``Delay`` object, swept with the flux pulse, waits on the drive of the high
+    qubit and on both acquisition channels.
+    """
+    sequence = PulseSequence([(f"q{low}/drive", rx()), (f"q{high}/drive", rx())])
+    flux, pulse = f"q{high}/flux", flux_pulse(WAITS_MAX)
+    sequence += [(flux, Delay(duration=RX)), (flux, pulse)]
+    wait, dt_delay = Delay(duration=WAITS_MAX), Delay(duration=dt)
+    for q in (low, high):
+        acquisition = f"q{q}/acquisition"
+        sequence += [(acquisition, Delay(duration=RX)), (acquisition, wait)]
+        sequence += [(acquisition, dt_delay), (acquisition, Delay(duration=RX))]
+    drive = f"q{high}/drive"
+    sequence += [(drive, wait), (drive, dt_delay), (drive, rx())]
+    sequence += [(f"q{q}/acquisition", readout()) for q in (low, high)]
+    return sequence, pulse, wait
+
+
+WAITS_MAX = 80
+"""Longest flux pulse of the chevron, in ns."""
+
+
+@pytest.mark.parametrize(
+    "acquisition_type", [AcquisitionType.INTEGRATION, AcquisitionType.DISCRIMINATION]
+)
+def test_chevron(connected, configs, acquisition_type):  # noqa: F811
+    """Duration of the flux pulse and of the delays, then its amplitude, as
+    ``chevron_signal`` (integration) and ``chevron`` (discrimination)."""
+    sequence, pulse, wait = chevron(0, 1)
+    sweepers = [
+        [duration([pulse, wait], np.arange(16, WAITS_MAX, 16))],
+        [amplitude([pulse])],
+    ]
+    opts = options(AveragingMode.CYCLIC).model_copy(
+        update={"acquisition_type": acquisition_type}
+    )
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    _check(results, [sequence], opts.results_shape(sweepers))
+
+
+def test_t1_flux(connected, configs):  # noqa: F811
+    """Flux amplitude, then the wait, on a flux pulse starting at 0 ns, as ``t1_flux``.
+
+    The wait is a ``Delay`` before the readout and the flux pulse during it.
+    """
+    sequence = PulseSequence()
+    delays, pulses = [], []
+    for q in (0, 1):
+        delay, pulse = Delay(duration=0), flux_pulse(0)
+        sequence += [(f"q{q}/drive", rx()), (f"q{q}/acquisition", Delay(duration=RX))]
+        sequence += [(f"q{q}/flux", Delay(duration=RX)), (f"q{q}/flux", pulse)]
+        sequence += [(f"q{q}/acquisition", delay), (f"q{q}/acquisition", readout())]
+        delays.append(delay)
+        pulses.append(pulse)
+    sweepers = [[amplitude(pulses)], [duration(delays + pulses, np.arange(0, 80, 16))]]
+    opts = discrimination(AveragingMode.SINGLESHOT)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    _check(results, [sequence], opts.results_shape(sweepers))
+
+
+def test_flux_gate(connected, configs):  # noqa: F811
+    """A flux pulse between two pi/2 pulses, its duration swept, as ``flux_gate``."""
+    sequence = PulseSequence()
+    swept = []
+    for q in QUBITS:
+        drive, acquisition, flux = f"q{q}/drive", f"q{q}/acquisition", f"q{q}/flux"
+        rx90, pulse = rx(), flux_pulse(WAITS_MAX)
+        wait, ro_wait = Delay(duration=WAITS_MAX), Delay(duration=WAITS_MAX)
+        sequence += [(drive, rx90), (flux, Delay(duration=RX)), (flux, pulse)]
+        sequence += [(drive, wait), (drive, rx90), (acquisition, ro_wait)]
+        sequence += [(acquisition, Delay(duration=2 * RX)), (acquisition, readout())]
+        swept += [pulse, wait, ro_wait]
+    sweepers = [[duration(swept, np.arange(16, WAITS_MAX, 16))]]
+    opts = discrimination(AveragingMode.SINGLESHOT)
+
+    results = connected.play(configs, [sequence], opts, sweepers)
+
+    _check(results, [sequence], opts.results_shape(sweepers))
+
+
+def test_flux_pulse_output(connected, configs, monkeypatch):  # noqa: F811
+    """A flux pulse plays after the drive, on top of the offset of its line."""
+    sequence = PulseSequence([("q0/drive", rx())])
+    sequence += [("q0/flux", Delay(duration=RX)), ("q0/flux", flux_pulse(64))]
+    compiled = []
+    compile = connected.session.compile
+    monkeypatch.setattr(
+        connected.session,
+        "compile",
+        lambda experiment: compiled.append(compile(experiment)) or compiled[-1],
+    )
+    configs["q0/flux"] = configs["q0/flux"].model_copy(update={"offset": 0.0})
+
+    connected.play(configs, [sequence], options(AveragingMode.CYCLIC), [])
+
+    flux = start(compiled[0], connected, "q0/flux")
+    drive = start(compiled[0], connected, "q0/drive")
+    assert flux - drive == pytest.approx(RX)

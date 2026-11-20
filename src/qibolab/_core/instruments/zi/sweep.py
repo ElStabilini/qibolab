@@ -29,14 +29,12 @@ def _channels_of(sequences: list[PulseSequence]) -> dict[PulseId, ChannelId]:
 def _real_time(id: ChannelId, calibration: Calibration) -> bool:
     """Whether a sweep of the channel ``id`` runs in real time.
 
-    It does if the channel's oscillator is modulated by the hardware (drive), and
-    not if it is modulated by the software (probe and acquisition): an SHFQA
-    generator cannot be swept in real time in integration mode.
+    It does if the channel has no oscillator (flux) or one modulated by the hardware
+    (drive), and not if it is modulated by the software (probe and acquisition): an
+    SHFQA generator cannot be swept in real time in integration mode.
     """
     oscillator = calibration[id].oscillator
-    return (
-        oscillator is not None and oscillator.modulation_type is ModulationType.HARDWARE
-    )
+    return oscillator is None or oscillator.modulation_type is ModulationType.HARDWARE
 
 
 def _group(
@@ -54,12 +52,13 @@ def _group(
     - frequency of a channel: the parameter replaces the frequency of the channel's
       oscillator in ``calibration``;
     - offset of a DC channel: the parameter replaces its ``voltage_offset`` in
-      ``calibration``, so the values are absolute. A DC channel has no oscillator, so
-      it is swept in near time;
+      ``calibration``, so the values are absolute. It is set when the experiment is
+      initialized, so it is always swept in near time;
     - amplitude and duration of pulses, and duration of delays: the parameter is
       recorded in ``swept``, to be used when the operation is played. The channel of a
       pulse is the one it is played on in the sequences, which for a :class:`Readout`
-      is its acquisition channel. Delays are always swept in real time.
+      is its acquisition channel. Delays, and pulses on DC channels (flux), are always
+      swept in real time.
     """
     parameters = []
     real_time = set()
@@ -75,7 +74,7 @@ def _group(
             for id in sweeper.channels:
                 calibration[id].voltage_offset = SweepParameter(values=sweeper.values)
                 parameters.append(calibration[id].voltage_offset)
-                real_time.add(_real_time(id, calibration))
+                real_time.add(False)
         elif sweeper.parameter is Parameter.amplitude:
             for pulse in {p.id: p for p in sweeper.pulses}.values():
                 swept.setdefault(pulse.id, {})["amplitude"] = SweepParameter(
